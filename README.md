@@ -29,7 +29,7 @@ sudo -i
 ### Шаг 2. Загрузка и запуск скрипта
 Выполните команду загрузки скрипта:
 ```bash
-wget -qO /root/synobot.sh [https://raw.githubusercontent.com/LocalHost-hub/syno_bot/main/syno_bot.sh](https://raw.githubusercontent.com/LocalHost-hub/syno_bot/main/syno_bot.sh) && chmod +x /root/synobot.sh
+wget -qO /root/synobot.sh https://raw.githubusercontent.com/LocalHost-hub/syno_bot/main/syno_bot.sh && chmod +x /root/synobot.sh
 ```
 
 **Первый запуск (Обязательно!)**
