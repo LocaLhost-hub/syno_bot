@@ -750,12 +750,7 @@ $SMB_USERS
 $WEB_USERS" "$KB_SYSTEM"
                 ;;
 
-            /kick_pts_*)
-                send_action
-                TARGET_TTY=$(echo "${TEXT#"/kick_"}" | tr '_' '/')
-                ( sleep 1 && pkill -9 -t "$TARGET_TTY" ) >/dev/null 2>&1 &
-                send_msg "🔫 SSH-сессия <b>$TARGET_TTY</b> разорвана!" "$KB_SYSTEM"
-                ;;
+            
                 
             /kick_*)
                 send_action
