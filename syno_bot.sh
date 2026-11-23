@@ -1,13 +1,19 @@
 #!/bin/bash
 
 # ==========================================
-# 🤖 SYNO BOT v2.3 (Full Suite: DSM Backup, HyperBackup, /du, WAN IP, Scheduler)
+# 🤖 SYNO BOT v2.4 (WireGuard + Docker Stats + /cmd + Auto-DSS + Ping Watchdog)
 # ==========================================
 
 CONFIG_FILE="/etc/synobot.conf"
 PID_FILE="/var/run/synobot.pid"
 MUTE_DIR="/etc/synobot_mute"
 TUNE_FLAG="/etc/synobot_autotune.enabled"
+AUTODSS_FLAG="/etc/synobot_autodss.enabled"
+AUTODSS_LAST="/etc/synobot_autodss.last"
+PING_CONF="/etc/synobot_ping.conf"
+WG_CONTAINER="wireguard"
+WG_ROUTES_FILE="/etc/synobot_wg_routes.conf"
+WG_NAT_FLAG="/etc/synobot_wg_nat.enabled"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 [ "$EUID" -ne 0 ] && echo "Запустите от root (sudo)!" && exit 1
@@ -166,10 +172,10 @@ KB_SYSTEM='{
         [{"text": "👥 Кто онлайн"}, {"text": "🏥 S.M.A.R.T."}],
         [{"text": "🗑 Корзины"}, {"text": "🔐 SSL"}],
         [{"text": "💾 Бэкап DSM"}, {"text": "📂 Топ папок (/du)"}],
-        [{"text": "🔓 Сброс 2FA"}, {"text": "🔄 Перезагрузка"}],
+        [{"text": "📡 Ping Watchdog"}, {"text": "🔓 Сброс 2FA"}],
         [{"text": "🔌 SSH Toggle"}, {"text": "🛡 Разбан IP"}],
-        [{"text": "⚡️ Ускорение DSM"}, {"text": "🆘 Создать Админа"}],
-        [{"text": "🔙 Назад в меню"}]
+        [{"text": "⚡️ Ускорение DSM"}, {"text": "🔄 Перезагрузка"}],
+        [{"text": "🆘 Создать Админа"}, {"text": "🔙 Назад в меню"}]
     ],
     "resize_keyboard": true
 }'
@@ -177,11 +183,11 @@ KB_SYSTEM='{
 KB_AUTO='{
     "keyboard": [
         [{"text": "🐳 Докер"}, {"text": "🔄 Обновить Compose"}],
-        [{"text": "📦 Apps"}, {"text": "📥 Загрузки (Download Station)"}],
-        [{"text": "📦 Hyper Backup"}, {"text": "⏱ Планировщик"}],
-        [{"text": "💻 Включить ПК"}, {"text": "🗜 Дедупликация"}],
-        [{"text": "🧠 Тюнинг Ядра"}, {"text": "👁 Радар папок"}],
-        [{"text": "🔙 Назад в меню"}]
+        [{"text": "🛡 WireGuard"}, {"text": "📦 Apps"}],
+        [{"text": "📥 Загрузки (Download Station)"}, {"text": "📦 Hyper Backup"}],
+        [{"text": "⏱ Планировщик"}, {"text": "💻 Включить ПК"}],
+        [{"text": "🗜 Дедупликация"}, {"text": "🧠 Тюнинг Ядра"}],
+        [{"text": "👁 Радар папок"}, {"text": "🔙 Назад в меню"}]
     ],
     "resize_keyboard": true
 }'
@@ -407,6 +413,57 @@ watch_health_daemon() {
                     fi
                     LAST_WAN_IP="$cur_wan"
                 fi
+            fi
+
+            # 6. Проверка unhealthy Docker-контейнеров (не чаще 1 раза в час на контейнер)
+            if command -v docker >/dev/null 2>&1; then
+                while read -r u_cont; do
+                    [ -z "$u_cont" ] && continue
+                    local safe_c flag_f last_t
+                    safe_c=$(echo "$u_cont" | tr -cd 'a-zA-Z0-9_-')
+                    flag_f="/tmp/syno_alerts/unhealthy_${safe_c}"
+                    last_t=$(cat "$flag_f" 2>/dev/null || echo 0)
+                    if [ $((NOW_TS - last_t)) -ge 3600 ]; then
+                        send_msg "🩺 <b>Docker Unhealthy!</b>"$'\n'"Контейнер <b>$(html_escape "$u_cont")</b> не проходит проверку здоровья (healthcheck)." ""
+                        echo "$NOW_TS" > "$flag_f"
+                    fi
+                done <<< "$(docker ps --filter 'health=unhealthy' --format '{{.Names}}' 2>/dev/null)"
+            fi
+
+            # 7. Еженедельный автобэкап конфигурации DSM (.dss)
+            if [ -f "$AUTODSS_FLAG" ]; then
+                local last_dss
+                last_dss=$(cat "$AUTODSS_LAST" 2>/dev/null || echo 0)
+                if [ $((NOW_TS - last_dss)) -ge 604800 ]; then
+                    local dss_f="/tmp/DSM_AutoBackup_$(hostname)_$(date '+%Y-%m-%d').dss"
+                    if /usr/syno/bin/synoconfbkp export --filepath="$dss_f" >/dev/null 2>&1 && [ -f "$dss_f" ]; then
+                        send_doc "$dss_f" "💾 <b>Автобэкап конфигурации DSM</b> ($(hostname))" ""
+                        rm -f "$dss_f"
+                        echo "$NOW_TS" > "$AUTODSS_LAST"
+                    fi
+                fi
+            fi
+
+            # 8. Ping Watchdog (доступность важных узлов)
+            if [ -s "$PING_CONF" ]; then
+                while IFS='|' read -r p_ip p_name; do
+                    [ -z "$p_ip" ] && continue
+                    local p_key p_state_f prev_st
+                    p_key=$(echo "$p_ip" | tr '.:/' '_')
+                    p_state_f="/tmp/syno_alerts/ping_${p_key}"
+                    prev_st=$(cat "$p_state_f" 2>/dev/null || echo "UP")
+                    if ping -c 2 -W 2 "$p_ip" >/dev/null 2>&1; then
+                        if [ "$prev_st" == "DOWN" ]; then
+                            send_msg "🟢 <b>Узел снова в сети!</b>"$'\n'"📡 <b>$(html_escape "${p_name:-$p_ip}")</b> (<code>$p_ip</code>)" ""
+                        fi
+                        echo "UP" > "$p_state_f"
+                    else
+                        if [ "$prev_st" != "DOWN" ]; then
+                            send_msg "🔴 <b>Узел недоступен!</b>"$'\n'"📡 <b>$(html_escape "${p_name:-$p_ip}")</b> (<code>$p_ip</code>)" ""
+                        fi
+                        echo "DOWN" > "$p_state_f"
+                    fi
+                done < "$PING_CONF"
             fi
         fi
         sleep 60
@@ -775,6 +832,179 @@ show_scheduler_tasks() {
     send_msg "$msg" "$KB_AUTO"
 }
 
+
+# ==========================================
+# 🛡 WIREGUARD DOCKER CLIENT MODULE
+# ==========================================
+
+detect_wg_dir() {
+    # 1. Явно заданный путь в /etc/synobot.conf
+    if [ -n "$WG_DIR" ]; then
+        echo "$WG_DIR"
+        return 0
+    fi
+    # 2. Если контейнер wireguard уже существует — берем его реальный том /config
+    if command -v docker >/dev/null 2>&1 && docker inspect "$WG_CONTAINER" >/dev/null 2>&1; then
+        local mnt
+        mnt=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$WG_CONTAINER" 2>/dev/null)
+        if [ -n "$mnt" ]; then
+            echo "$mnt"
+            return 0
+        fi
+    fi
+    # 3. Автопоиск папки docker на всех томах (/volume*/docker)
+    local d
+    for d in /volume*/docker; do
+        if [ -d "$d" ]; then
+            echo "${d}/wireguard"
+            return 0
+        fi
+    done
+    # 4. Фолбэк
+    echo "/volume1/docker/wireguard"
+}
+
+wg_apply_routes_and_nat() {
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    if ! ip link show wg0 >/dev/null 2>&1; then
+        return 1
+    fi
+    if [ -s "$WG_ROUTES_FILE" ]; then
+        while read -r cidr; do
+            [ -z "$cidr" ] && continue
+            ip route replace "$cidr" dev wg0 2>/dev/null
+        done < "$WG_ROUTES_FILE"
+    fi
+    if [ -f "$WG_NAT_FLAG" ]; then
+        iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+        iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT
+        iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT
+    fi
+}
+
+wg_install_container() {
+    if ! command -v docker >/dev/null 2>&1; then
+        send_msg "❌ Docker (Container Manager) не установлен на NAS." "$KB_AUTO"
+        return 1
+    fi
+    local target_dir
+    target_dir=$(detect_wg_dir)
+    mkdir -p "$target_dir/wg_confs"
+
+    # Создаем /dev/net/tun при необходимости
+    if [ ! -c /dev/net/tun ]; then
+        mkdir -p /dev/net
+        mknod /dev/net/tun c 10 200 2>/dev/null
+        chmod 600 /dev/net/tun 2>/dev/null
+    fi
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+
+    send_msg "⏳ <b>Устанавливаю контейнер WireGuard...</b>"$'\n'"📁 Папка: <code>$(html_escape "$target_dir")</code>"$'\n'"<i>(Скачивание образа может занять 1–2 минуты)</i>" "$KB_AUTO"
+
+    (
+        local out
+        docker rm -f "$WG_CONTAINER" >/dev/null 2>&1
+        out=$(docker run -d \
+            --name="$WG_CONTAINER" \
+            --net=host \
+            --cap-add=NET_ADMIN \
+            --cap-add=SYS_MODULE \
+            -e PUID=0 \
+            -e PGID=0 \
+            -e TZ=Europe/Moscow \
+            -v "$target_dir:/config" \
+            -v /lib/modules:/lib/modules:ro \
+            --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+            --restart unless-stopped \
+            lscr.io/linuxserver/wireguard:latest 2>&1)
+        local rc=$?
+        if [ "$rc" -eq 0 ]; then
+            sleep 4
+            wg_apply_routes_and_nat
+            if [ -f "$target_dir/wg_confs/wg0.conf" ]; then
+                send_msg "✅ <b>WireGuard установлен и запущен!</b>"$'\n'"📁 Папка: <code>$(html_escape "$target_dir")</code>"$'\n'"Проверить статус: /wg_status" "$KB_AUTO"
+            else
+                send_msg "✅ <b>Контейнер WireGuard установлен!</b>"$'\n'"📁 Папка: <code>$(html_escape "$target_dir")</code>"$'\n\n'"📎 <b>Теперь просто отправьте мне файл <code>.conf</code> прямо в этот чат</b> — я положу его в <code>wg0.conf</code> и запущу туннель." "$KB_AUTO"
+            fi
+        else
+            send_msg "🔴 <b>Ошибка установки WireGuard:</b>"$'\n'"<code>$(html_escape "${out: -2500}")</code>" "$KB_AUTO"
+        fi
+    ) &
+}
+
+show_wg_menu() {
+    local target_dir c_state cfg_st nat_st routes_txt
+    target_dir=$(detect_wg_dir)
+
+    if ! command -v docker >/dev/null 2>&1; then
+        send_msg "❌ Docker не установлен." "$KB_AUTO"
+        return 1
+    fi
+
+    c_state=$(docker inspect -f '{{.State.Status}}' "$WG_CONTAINER" 2>/dev/null)
+    if [ "$c_state" == "running" ]; then
+        c_state="🟢 Запущен"
+    elif [ -n "$c_state" ]; then
+        c_state="🔴 Остановлен ($c_state)"
+    else
+        c_state="⚪️ Не установлен"
+    fi
+
+    [ -f "$target_dir/wg_confs/wg0.conf" ] && cfg_st="✅ Загружен (wg0.conf)" || cfg_st="❌ Нет конфига"
+    if [ -f "$WG_NAT_FLAG" ]; then
+        nat_st="🟢 ВКЛ (/wg_nat_off)"
+    else
+        nat_st="⚪️ ВЫКЛ (/wg_nat_on)"
+    fi
+
+    routes_txt=""
+    if [ -s "$WG_ROUTES_FILE" ]; then
+        while read -r r; do
+            [ -z "$r" ] && continue
+            routes_txt="${routes_txt}"$'\n'"   • <code>$r</code>"
+        done < "$WG_ROUTES_FILE"
+    else
+        routes_txt=$'\n'"   (нет доп. маршрутов)"
+    fi
+
+    send_msg "🛡 <b>WireGuard Клиент (Docker host)</b>
+
+📊 Контейнер: <b>$c_state</b>
+📄 Конфиг: $cfg_st
+📁 Папка: <code>$(html_escape "$target_dir")</code>
+🔀 NAT (MASQUERADE): $nat_st
+🗺 Доп. маршруты:$routes_txt
+
+<b>Управление:</b>
+🔍 Статус и трафик: /wg_status
+▶️ Старт: /wg_start | ⏹ Стоп: /wg_stop | 🔄 Рестарт: /wg_restart
+🛠 Установить / пересоздать: /wg_install
+
+<b>Настройка:</b>
+📎 Отправьте <code>.conf</code> файл в чат для загрузки конфига
+📁 Сменить папку: <code>/wg_setdir /volume2/docker/wireguard</code>
+➕ Добавить маршрут: <code>/wg_route_add 192.168.10.0/24</code>
+➖ Удалить маршрут: <code>/wg_route_del 192.168.10.0/24</code>" "$KB_AUTO"
+}
+
+show_ping_menu() {
+    local msg="📡 <b>Ping Watchdog (мониторинг узлов):</b>"
+    if [ ! -s "$PING_CONF" ]; then
+        msg="${msg}"$'\n'"(Список узлов пуст)"
+    else
+        while IFS='|' read -r p_ip p_name; do
+            [ -z "$p_ip" ] && continue
+            if ping -c 1 -W 2 "$p_ip" >/dev/null 2>&1; then
+                msg="${msg}"$'\n'"🟢 <b>$(html_escape "${p_name:-$p_ip}")</b> (<code>$p_ip</code>)"
+            else
+                msg="${msg}"$'\n'"🔴 <b>$(html_escape "${p_name:-$p_ip}")</b> (<code>$p_ip</code>)"
+            fi
+        done < "$PING_CONF"
+    fi
+    msg="${msg}"$'\n\n'"➕ Добавить: <code>/ping_add 10.252.1.1 VPS</code>"$'\n'"➖ Удалить: <code>/ping_del 10.252.1.1</code>"
+    send_msg "$msg" "$KB_SYSTEM"
+}
+
 # Запуск фоновых мониторов
 watch_sys_logs &
 watch_pkg_logs &
@@ -785,7 +1015,7 @@ watch_folder_daemon &
 watch_health_daemon &
 
 echo "🚀 Бот запущен (PID: $$)..."
-send_msg "✅ <b>SynoBot v2.3 запущен!</b>"$'\n'"Привет, Босс." "$KB_MAIN"
+send_msg "✅ <b>SynoBot v2.4 запущен!</b>"$'\n'"Привет, Босс." "$KB_MAIN"
 
 # ==========================================
 # 🔁 ГЛАВНЫЙ ЦИКЛ ОПРОСА
@@ -835,6 +1065,30 @@ while true; do
                 rm -f "$TMP_TORRENT"
             else
                 send_msg "❌ Не удалось получить файл из Telegram." "$KB_AUTO"
+            fi
+            continue
+        fi
+
+        # --- ПРИЕМ WIREGUARD .CONF ФАЙЛОВ ---
+        if [ -n "$DOC_ID" ] && [[ "$DOC_NAME" == *.conf ]]; then
+            send_action
+            local_wg_dir=$(detect_wg_dir)
+            mkdir -p "$local_wg_dir/wg_confs"
+            FILE_PATH=$(curl -s --connect-timeout 10 --max-time 20 "$URL/getFile?file_id=$DOC_ID" | jq -r '.result.file_path // empty')
+            if [ -n "$FILE_PATH" ]; then
+                curl -s --connect-timeout 10 --max-time 30 "$FILE_URL/$FILE_PATH" -o "$local_wg_dir/wg_confs/wg0.conf"
+                sed -i 's/\r$//' "$local_wg_dir/wg_confs/wg0.conf"
+                chmod 600 "$local_wg_dir/wg_confs/wg0.conf"
+                if command -v docker >/dev/null 2>&1 && docker inspect "$WG_CONTAINER" >/dev/null 2>&1; then
+                    docker restart "$WG_CONTAINER" >/dev/null 2>&1
+                    sleep 3
+                    wg_apply_routes_and_nat
+                    send_msg "✅ <b>Конфиг WireGuard загружен и применен!</b>"$'\n'"📄 Файл: <code>$(html_escape "$DOC_NAME")</code> ➔ <code>wg0.conf</code>"$'\n'"📁 Папка: <code>$(html_escape "$local_wg_dir/wg_confs")</code>"$'\n'"Проверить туннель: /wg_status" "$KB_AUTO"
+                else
+                    send_msg "✅ <b>Конфиг сохранен в <code>$(html_escape "$local_wg_dir/wg_confs/wg0.conf")</code>!</b>"$'\n'"Контейнер еще не установлен — нажмите /wg_install для запуска." "$KB_AUTO"
+                fi
+            else
+                send_msg "❌ Не удалось скачать <code>.conf</code> файл из Telegram." "$KB_AUTO"
             fi
             continue
         fi
@@ -1095,7 +1349,7 @@ Health Status: <b>${HEALTH:-N/A}</b>
                         D_MSG="${D_MSG}"$'\n'"🔴 <b>$(html_escape "$name")</b>"$'\n'"   └ /start_$name | /logs_$name"
                     fi
                 done <<< "$EXISTING"
-                D_MSG="${D_MSG}"$'\n\n'"🔄 Обновить Compose-проекты: /compose"$'\n'"🧹 Очистить неиспользуемые образы: /docker_prune"
+                D_MSG="${D_MSG}"$'\n\n'"📊 Нагрузка контейнеров: /docker_stats"$'\n'"🔄 Обновить Compose-проекты: /compose"$'\n'"🧹 Очистить неиспользуемые образы: /docker_prune"
                 send_msg "$D_MSG" "$KB_AUTO"
                 ;;
 
@@ -1104,6 +1358,136 @@ Health Status: <b>${HEALTH:-N/A}</b>
                 PRUNE_OUT=$(docker image prune -f 2>&1 | tail -n 5)
                 send_msg "🧹 <b>Docker Prune выполнен:</b>"$'\n'"<code>$(html_escape "$PRUNE_OUT")</code>" "$KB_AUTO"
                 ;;
+
+            "/docker_stats")
+                send_action
+                if ! command -v docker >/dev/null 2>&1; then
+                    send_msg "❌ Docker не установлен." "$KB_AUTO"
+                    continue
+                fi
+                STATS_OUT=$(docker stats --no-stream --format "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}" 2>/dev/null)
+                S_MSG="📊 <b>Нагрузка Docker-контейнеров:</b>"
+                if [ -z "$STATS_OUT" ]; then
+                    S_MSG="${S_MSG}"$'\n'"(Нет запущенных контейнеров)"
+                else
+                    while IFS='|' read -r s_name s_cpu s_mem; do
+                        [ -z "$s_name" ] && continue
+                        S_MSG="${S_MSG}"$'\n'"🔹 <b>$(html_escape "$s_name")</b>: CPU <code>$s_cpu</code> | RAM <code>$s_mem</code>"
+                    done <<< "$STATS_OUT"
+                fi
+                send_msg "$S_MSG" "$KB_AUTO"
+                ;;
+
+            "🛡 WireGuard" | "/wg")
+                send_action
+                show_wg_menu
+                ;;
+
+            "/wg_install")
+                send_action
+                wg_install_container
+                ;;
+
+            "/wg_start")
+                send_action
+                docker start "$WG_CONTAINER" >/dev/null 2>&1 && sleep 3 && wg_apply_routes_and_nat && send_msg "▶️ <b>WireGuard запущен!</b>" "$KB_AUTO" || send_msg "❌ Не удалось запустить контейнер $WG_CONTAINER." "$KB_AUTO"
+                ;;
+
+            "/wg_stop")
+                send_action
+                docker stop "$WG_CONTAINER" >/dev/null 2>&1 && send_msg "⏹ <b>WireGuard остановлен.</b>" "$KB_AUTO" || send_msg "❌ Ошибка остановки $WG_CONTAINER." "$KB_AUTO"
+                ;;
+
+            "/wg_restart")
+                send_action
+                docker restart "$WG_CONTAINER" >/dev/null 2>&1 && sleep 3 && wg_apply_routes_and_nat && send_msg "🔄 <b>WireGuard перезапущен!</b>" "$KB_AUTO" || send_msg "❌ Ошибка перезапуска $WG_CONTAINER." "$KB_AUTO"
+                ;;
+
+            "/wg_status")
+                send_action
+                WG_OUT=$(docker exec "$WG_CONTAINER" wg show 2>/dev/null || wg show 2>/dev/null)
+                [ -z "$WG_OUT" ] && WG_OUT="(интерфейс wg0 не активен)"
+                WG_ROUTES=$(ip route show dev wg0 2>/dev/null)
+                [ -z "$WG_ROUTES" ] && WG_ROUTES="(нет)"
+                CUR_IP=$(curl -s --connect-timeout 5 -4 https://api.ipify.org)
+                send_msg "🔍 <b>Статус WireGuard:</b>"$'\n'"🌍 Текущий WAN IP: <code>${CUR_IP:-N/A}</code>"$'\n\n'"<code>$(html_escape "$WG_OUT")</code>"$'\n\n'"🗺 <b>Маршруты wg0:</b>"$'\n'"<code>$(html_escape "$WG_ROUTES")</code>" "$KB_AUTO"
+                ;;
+
+            "/wg_setdir "*)
+                NEW_WG_DIR="${TEXT#"/wg_setdir "}"
+                NEW_WG_DIR="${NEW_WG_DIR%/}"
+                if [[ "$NEW_WG_DIR" == /* ]]; then
+                    mkdir -p "$NEW_WG_DIR/wg_confs"
+                    sed -i '/^WG_DIR=/d' "$CONFIG_FILE"
+                    echo "WG_DIR=\"$NEW_WG_DIR\"" >> "$CONFIG_FILE"
+                    WG_DIR="$NEW_WG_DIR"
+                    send_msg "✅ <b>Папка WireGuard обновлена:</b>"$'\n'"<code>$(html_escape "$WG_DIR")</code>"$'\n'"<i>(Если контейнер уже был создан со старым путем, нажмите /wg_install для пересоздания)</i>" "$KB_AUTO"
+                else
+                    send_msg "❌ Укажите полный путь (например: <code>/volume2/docker/wireguard</code>)." "$KB_AUTO"
+                fi
+                ;;
+
+            "/wg_route_add "*)
+                NEW_CIDR=$(echo "${TEXT#"/wg_route_add "}" | xargs)
+                if [[ "$NEW_CIDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                    touch "$WG_ROUTES_FILE"
+                    grep -qx "$NEW_CIDR" "$WG_ROUTES_FILE" || echo "$NEW_CIDR" >> "$WG_ROUTES_FILE"
+                    ip route replace "$NEW_CIDR" dev wg0 2>/dev/null
+                    send_msg "✅ Маршрут <code>$NEW_CIDR</code> ➔ <b>wg0</b> добавлен и сохранен." "$KB_AUTO"
+                else
+                    send_msg "❌ Некорректный формат. Пример: <code>/wg_route_add 192.168.10.0/24</code>" "$KB_AUTO"
+                fi
+                ;;
+
+            "/wg_route_del "*)
+                DEL_CIDR=$(echo "${TEXT#"/wg_route_del "}" | xargs)
+                if [ -f "$WG_ROUTES_FILE" ]; then
+                    grep -vx "$DEL_CIDR" "$WG_ROUTES_FILE" > "${WG_ROUTES_FILE}.tmp" && mv "${WG_ROUTES_FILE}.tmp" "$WG_ROUTES_FILE"
+                fi
+                ip route del "$DEL_CIDR" dev wg0 2>/dev/null
+                send_msg "🗑 Маршрут <code>$(html_escape "$DEL_CIDR")</code> удален." "$KB_AUTO"
+                ;;
+
+            "/wg_nat_on")
+                touch "$WG_NAT_FLAG"
+                wg_apply_routes_and_nat
+                send_msg "✅ <b>NAT (MASQUERADE) на wg0 включен!</b>" "$KB_AUTO"
+                ;;
+
+            "/wg_nat_off")
+                rm -f "$WG_NAT_FLAG"
+                while iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null; do :; done
+                send_msg "⚪️ <b>NAT (MASQUERADE) на wg0 выключен.</b>" "$KB_AUTO"
+                ;;
+
+            "📡 Ping Watchdog" | "/ping")
+                send_action
+                show_ping_menu
+                ;;
+
+            "/ping_add "*)
+                P_ARGS="${TEXT#"/ping_add "}"
+                P_IP=$(echo "$P_ARGS" | awk '{print $1}')
+                P_NAME=$(echo "$P_ARGS" | cut -s -d' ' -f2-)
+                [ -z "$P_NAME" ] && P_NAME="$P_IP"
+                if [[ "$P_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    touch "$PING_CONF"
+                    sed -i "/^${P_IP}|/d" "$PING_CONF"
+                    echo "${P_IP}|${P_NAME}" >> "$PING_CONF"
+                    send_msg "✅ Узел <b>$(html_escape "$P_NAME")</b> (<code>$P_IP</code>) добавлен в Ping Watchdog." "$KB_SYSTEM"
+                else
+                    send_msg "❌ Некорректный IP. Пример: <code>/ping_add 10.252.1.1 VPS</code>" "$KB_SYSTEM"
+                fi
+                ;;
+
+            "/ping_del "*)
+                P_DEL=$(echo "${TEXT#"/ping_del "}" | awk '{print $1}')
+                if [ -f "$PING_CONF" ]; then
+                    sed -i "/^${P_DEL}|/d" "$PING_CONF"
+                    send_msg "🗑 Узел <code>$(html_escape "$P_DEL")</code> удален из Ping Watchdog." "$KB_SYSTEM"
+                fi
+                ;;
+
 
             "/compose" | "🔄 Обновить Compose")
                 send_action
@@ -1326,14 +1710,38 @@ Health Status: <b>${HEALTH:-N/A}</b>
                 ;;
 
             "🤖 Бот")
-                send_msg "🤖 <b>Управление SynoBot v2.3</b>
+                [ -f "$AUTODSS_FLAG" ] && DSS_ST="🟢 ВКЛ (/autodss_off)" || DSS_ST="⚪️ ВЫКЛ (/autodss_on)"
+                send_msg "🤖 <b>Управление SynoBot v2.4</b>
 
 🔄 Перезапустить бота: /bot_restart
 ⬆️ Обновить с GitHub: /bot_update
+💾 Автобэкап DSM (.dss раз в 7 дн.): $DSS_ST
+💻 Терминал: <code>/cmd ваша_команда</code>
+
 🔗 Задать URL репозитория:
 <code>/set_repo https://raw.githubusercontent.com/.../syno_bot.sh</code>
-
 Текущий URL: <code>${BOT_REPO_URL:-не задан}</code>" "$KB_MAIN"
+                ;;
+
+            "/autodss_on")
+                touch "$AUTODSS_FLAG"
+                send_msg "✅ <b>Еженедельный автобэкап DSM (.dss) включен!</b>" "$KB_MAIN"
+                ;;
+
+            "/autodss_off")
+                rm -f "$AUTODSS_FLAG"
+                send_msg "⚪️ <b>Автобэкап DSM (.dss) выключен.</b>" "$KB_MAIN"
+                ;;
+
+            "/cmd "*)
+                send_action
+                CMD_STR="${TEXT#"/cmd "}"
+                CMD_OUT=$(timeout 15 bash -c "$CMD_STR" 2>&1)
+                [ -z "$CMD_OUT" ] && CMD_OUT="(пустой вывод)"
+                if [ ${#CMD_OUT} -gt 3500 ]; then
+                    CMD_OUT="${CMD_OUT:0:3500}..."$'\n'"[Обрезано]"
+                fi
+                send_msg "💻 <b>Команда:</b> <code>$(html_escape "$CMD_STR")</code>"$'\n\n'"<code>$(html_escape "$CMD_OUT")</code>" ""
                 ;;
 
             "/set_repo "*)
@@ -1357,8 +1765,7 @@ Health Status: <b>${HEALTH:-N/A}</b>
                     send_action
                     TMP_UP="/tmp/synobot_update.sh"
                     if curl -fsSL --connect-timeout 10 --max-time 30 "$BOT_REPO_URL" -o "$TMP_UP"; then
-                        sed -i 's/
-$//' "$TMP_UP"
+                        sed -i 's/\r$//' \"$TMP_UP\"
                         if bash -n "$TMP_UP" 2>/dev/null; then
                             cp "$TMP_UP" "$SCRIPT_PATH"
                             chmod +x "$SCRIPT_PATH"
@@ -1828,4 +2235,5 @@ $WEB_USERS" "$KB_SYSTEM"
     LAST_ID=$(echo "$UPDATES" | jq -r '.result[-1].update_id // empty')
     [ -n "$LAST_ID" ] && OFFSET=$((LAST_ID + 1))
 done
+
 
